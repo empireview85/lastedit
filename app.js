@@ -577,6 +577,8 @@ let hotelData = {
     incomeResets: [],
     outsideIncomeResets: [],
     purchasesResets: [],
+    deletedRoomIds: [],
+    deletedGuestIds: [],
     users: [
         { id: 1, name: 'Admin', email: 'admin@hotel.com', password: 'admin123', role: 'admin' }
     ]
@@ -621,6 +623,10 @@ document.addEventListener('DOMContentLoaded', function() {
                     return window.fbDb.ref('hotelData').once('value').then(dataSnap => {
                         const fbData = dataSnap.val();
                         if (fbData) { hotelData = fbMerge(fbData); localStorage.setItem('hotelData', JSON.stringify(hotelData)); }
+                        // A restored session (tab left open, tablet just woke up, etc.) never goes
+                        // through the login form, so roll the shift over here if the open one is
+                        // clearly stale — see ensureFreshShiftSession().
+                        if (loggedInUser.role === 'reception' || loggedInUser.role === 'admin') ensureFreshShiftSession();
                         showApp();
                         setupFirebaseRealtimeListener();
                     });
@@ -984,6 +990,7 @@ function deleteRoom(roomId) {
     }
     if (!confirm(`Delete Room ${room.number}? This cannot be undone.`)) return;
     hotelData.rooms = hotelData.rooms.filter(r => r.id !== roomId);
+    recordTombstone('deletedRoomIds', roomId);
     saveDataToStorage();
     showToast(`Room ${room.number} deleted.`, 'success');
     loadRoomsPage();
@@ -2666,6 +2673,7 @@ function adminDeleteCheckIn(guestId) {
         room.status = bookable ? bookable.id : 'available';
     }
     hotelData.guests = hotelData.guests.filter(g => g.id !== guestId);
+    recordTombstone('deletedGuestIds', guestId);
     saveDataToStorage();
     addActivity(`Admin deleted check-in for ${guest.name}`);
     showToast('Check-in deleted.', 'success');
@@ -4121,9 +4129,21 @@ function updateUserField(index, field, value) {
     saveDataToStorage();
 }
 
+// Changing your OWN password can be done directly via Firebase Auth (updatePassword), so that
+// still opens the inline modal. But a client-side app can never set *another* user's password
+// directly without the Admin SDK/Cloud Functions — the old code here faked it by writing a
+// plaintext "tempPassword" to the database and telling the admin it worked, except nothing ever
+// read that field back, so the target user's real password never actually changed. Firebase's
+// built-in reset email is the real, working, secure way to do this client-side.
 function sendPasswordReset(email) {
-    // Open inline password change modal instead of sending email
-    openChangePasswordModal(email);
+    if (loggedInUser && email === loggedInUser.email) {
+        openChangePasswordModal(email);
+        return;
+    }
+    if (!confirm(`Send a password reset email to ${email}?`)) return;
+    window.fbAuth.sendPasswordResetEmail(email)
+        .then(() => showToast(`Password reset email sent to ${email}.`, 'success'))
+        .catch(err => showToast(err.message, 'error'));
 }
 
 let _passwordChangeTargetEmail = null;
@@ -4157,50 +4177,27 @@ function handleChangePassword(e) {
     errEl.style.display = 'none';
     btn.disabled = true;
 
-    // Update current user's password (admin changing their own)
-    // OR admin changing another user's password via Firebase Auth
+    // This modal is only ever opened for changing your OWN password (sendPasswordReset() routes
+    // any other user straight to a real Firebase reset email instead) — Firebase Auth lets a
+    // signed-in user update their own password directly, no Admin SDK needed.
     const currentUser = window.fbAuth.currentUser;
-
-    if (_passwordChangeTargetEmail && currentUser && currentUser.email === _passwordChangeTargetEmail) {
-        // Changing own password
-        currentUser.updatePassword(newPass)
-            .then(() => {
-                btn.disabled = false;
-                closeModal('changePasswordModal');
-                showToast('Password updated successfully!', 'success');
-            })
-            .catch(err => {
-                btn.disabled = false;
-                errEl.textContent = err.message;
-                errEl.style.display = 'block';
-            });
-    } else {
-        // For changing another user's password, we need to use Firebase Admin SDK
-        // Client-side cannot change other users' passwords directly
-        // We'll store the new password in the user's profile and they can use it on next login
-        // (This is a workaround — full implementation requires Cloud Functions)
-        const targetUser = hotelData.users.find(u => u.email === _passwordChangeTargetEmail);
-        if (targetUser && targetUser.uid) {
-            window.fbDb.ref('users/' + targetUser.uid + '/tempPassword').set(newPass)
-                .then(() => {
-                    btn.disabled = false;
-                    closeModal('changePasswordModal');
-                    showToast('Password marked for update. User must re-login for it to take effect.', 'success');
-                    // Also update in hotelData
-                    if (!targetUser.tempPassword) targetUser.tempPassword = newPass;
-                    saveDataToStorage();
-                })
-                .catch(err => {
-                    btn.disabled = false;
-                    errEl.textContent = err.message;
-                    errEl.style.display = 'block';
-                });
-        } else {
-            btn.disabled = false;
-            errEl.textContent = 'User not found.';
-            errEl.style.display = 'block';
-        }
+    if (!currentUser) {
+        btn.disabled = false;
+        errEl.textContent = 'Not signed in.';
+        errEl.style.display = 'block';
+        return;
     }
+    currentUser.updatePassword(newPass)
+        .then(() => {
+            btn.disabled = false;
+            closeModal('changePasswordModal');
+            showToast('Password updated successfully!', 'success');
+        })
+        .catch(err => {
+            btn.disabled = false;
+            errEl.textContent = err.message;
+            errEl.style.display = 'block';
+        });
 }
 
 function removeUser(index) {
@@ -4293,6 +4290,8 @@ function resetToProduction() {
         hotelData.reservationLog = [];
         hotelData.orders = [];
         hotelData.priceHistory = [];
+        hotelData.deletedRoomIds = [];
+        hotelData.deletedGuestIds = [];
 
         saveDataToStorage();
         showToast('Database reset for production — rooms kept, all test activity cleared.', 'success');
@@ -4509,6 +4508,26 @@ function getOrStartCurrentShift() {
         saveDataToStorage();
     }
     return open;
+}
+
+// Firebase keeps an authenticated session alive across page reloads and even across days (that's
+// what onAuthStateChanged auto-restoring is for) — but startShiftSession() only ever ran from the
+// login *form* submit. So a staff member who never explicitly clicks Logout (they just close the
+// tablet, or it goes to sleep) keeps reusing the SAME open shift indefinitely — it can never roll
+// over on its own, which is why a shift opened weeks ago can still show up as "current" today.
+// Called on every auto-restored session: leaves a genuinely still-ongoing shift alone (so page
+// refreshes mid-shift don't fragment it), but closes out anything open for longer than a shift
+// could plausibly run and starts a fresh one, so "current shift" always actually means today.
+const MAX_PLAUSIBLE_SHIFT_HOURS = 18;
+function ensureFreshShiftSession() {
+    const staff = loggedInUser?.name || loggedInUser?.email || '—';
+    if (!Array.isArray(hotelData.shiftLog)) hotelData.shiftLog = [];
+    const open = [...hotelData.shiftLog].reverse().find(s => s.staff === staff && !s.logoutAt);
+    if (!open) { startShiftSession(); return; }
+    const hoursOpen = (Date.now() - new Date(open.loginAt).getTime()) / 3600000;
+    if (hoursOpen > MAX_PLAUSIBLE_SHIFT_HOURS) {
+        startShiftSession(); // closes the stale one and opens a fresh one, same as a real login would
+    }
 }
 
 // Admin shortcut: jump straight to a staff member's open (live, still logged in) session,
@@ -5005,10 +5024,43 @@ function logout() {
 }
 
 // ==================== STORAGE ====================
+// Marks an id as deliberately deleted (room or guest) so a later merge (see saveDataToStorage)
+// never resurrects it just because some tab's local copy doesn't have it. Pruned to the last 500
+// so this list can't grow forever.
+function recordTombstone(listName, id) {
+    if (!Array.isArray(hotelData[listName])) hotelData[listName] = [];
+    hotelData[listName].push({ id, deletedAt: new Date().toISOString() });
+    if (hotelData[listName].length > 500) hotelData[listName] = hotelData[listName].slice(-500);
+}
+
+// Rooms and guests are the two collections every role touches constantly and concurrently —
+// reception checking a guest in on the front-desk terminal while a cleaner's tablet (which may
+// have been sitting idle/backgrounded for a while, delaying its realtime sync) marks a different
+// room clean, for instance. A plain .set(hotelData) replaces the ENTIRE database with whatever
+// this one browser tab currently has in memory — so if that tab's copy is even slightly behind,
+// saving from it silently erases any room/guest that changed elsewhere in the meantime (a stale
+// tab's local currentGuest:null on some room "wins" and wipes out today's real occupant, etc.).
+// To close that window, pull the freshest rooms/guests from the server immediately before writing
+// and fold in anything the local copy doesn't know about yet, so an idle tab can't erase someone
+// else's more recent work just because it doesn't know about it yet. Anything in the matching
+// tombstone list is excluded from being folded back in — that's a deliberate deletion, not staleness.
 function saveDataToStorage() {
-    if (window.fbDb && loggedInUser) {
+    if (!(window.fbDb && loggedInUser)) return;
+    window.fbDb.ref('hotelData').once('value').then(snap => {
+        const server = snap.val() || {};
+        const mergeUnknownIn = (localArr, serverArr, tombstoneList) => {
+            const localIds = new Set((localArr || []).map(x => x.id));
+            const deletedIds = new Set((tombstoneList || []).map(t => t.id));
+            const missingFromLocal = serverArr.filter(x => !localIds.has(x.id) && !deletedIds.has(x.id));
+            return [...missingFromLocal, ...(localArr || [])];
+        };
+        hotelData.rooms  = mergeUnknownIn(hotelData.rooms,  toArr(server.rooms),  hotelData.deletedRoomIds);
+        hotelData.guests = mergeUnknownIn(hotelData.guests, toArr(server.guests), hotelData.deletedGuestIds);
         window.fbDb.ref('hotelData').set(hotelData).catch(() => {});
-    }
+    }).catch(() => {
+        // Offline or the read failed — still try to save rather than losing the change entirely.
+        window.fbDb.ref('hotelData').set(hotelData).catch(() => {});
+    });
 }
 
 function loadDataFromStorage() {
@@ -6108,6 +6160,8 @@ function fbMerge(fbData) {
         shiftLog:       toArr(fbData.shiftLog),
         reservationLog: toArr(fbData.reservationLog),
         users:          toArr(fbData.users),
+        deletedRoomIds:  toArr(fbData.deletedRoomIds),
+        deletedGuestIds: toArr(fbData.deletedGuestIds),
         settings:   { ...hotelData.settings, ...(fbData.settings || {}),
             roomStatuses: ensureDefaultRoomStatuses(rawStatuses) }
     };
