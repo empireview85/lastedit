@@ -3352,18 +3352,21 @@ function updateRecentActivities() {
     const recentActs = hotelData.activities.slice(-10).reverse();
 
     if (recentActs.length === 0) {
-        table.innerHTML = `<tr><td colspan="5" class="text-center text-gray-500 py-8">${t('no_recent')}</td></tr>`;
+        table.innerHTML = `<tr><td colspan="6" class="text-center text-gray-500 py-8">${t('no_recent')}</td></tr>`;
         return;
     }
 
+    const locale = currentLang === 'ar' ? 'ar-IQ' : 'en-US';
     recentActs.forEach(activity => {
         const row = document.createElement('tr');
+        const roleLabel = activity.userRole ? (t('role_' + activity.userRole) || activity.userRole) : '-';
         row.innerHTML = `
-            <td>${activity.guestName || activity.description}</td>
+            <td>${activity.timestamp ? new Date(activity.timestamp).toLocaleString(locale) : '-'}</td>
+            <td>${activity.description || '-'}</td>
             <td>${activity.roomNumber || '-'}</td>
-            <td>${activity.action}</td>
-            <td>${new Date(activity.timestamp).toLocaleTimeString()}</td>
-            <td>${activity.amount || '-'}</td>
+            <td>${activity.userName || '-'}</td>
+            <td>${roleLabel}</td>
+            <td>${activity.amount != null ? activity.amount : '-'}</td>
         `;
         table.appendChild(row);
     });
@@ -4255,8 +4258,9 @@ function resetToProduction() {
     if (loggedInUser?.role !== 'admin') { showToast(t('access_denied'), 'error'); return; }
 
     const warning = 'This will permanently delete ALL guests, check-ins/outs, reservations, purchases, ' +
-        'outside income, services, activity log, and shift history from the database.\n\n' +
-        'Room numbers/types/prices and all user accounts will be KEPT, but every room\'s status will reset to Available.\n\n' +
+        'outside income, services, and shift history from the database.\n\n' +
+        'Room numbers/types/prices, the Activity Log, and all user accounts will be KEPT, but every ' +
+        'room\'s status will reset to Available.\n\n' +
         'This cannot be undone. Continue?';
     if (!confirm(warning)) return;
 
@@ -4283,7 +4287,8 @@ function resetToProduction() {
             isTemporary: false, savedReservation: null, priceHistory: []
         }));
         hotelData.guests = [];
-        hotelData.activities = [];
+        // Activity Log is deliberately kept — it's the audit trail of who did what, which stays
+        // meaningful across a reset rather than being test data itself.
         hotelData.purchases = [];
         hotelData.outsideIncome = [];
         hotelData.shiftLog = [];
@@ -4292,9 +4297,24 @@ function resetToProduction() {
         hotelData.priceHistory = [];
         hotelData.deletedRoomIds = [];
         hotelData.deletedGuestIds = [];
+        // These are the Dashboard "Reset Counter" baselines (income/purchases/outside-income cards)
+        // — without clearing them too, the cards would keep subtracting an old baseline from the
+        // now-empty totals and show stale (often negative) leftover numbers instead of a clean $0.
+        hotelData.incomeResets = [];
+        hotelData.incomeResetsIQD = [];
+        hotelData.incomeResetsUSD = [];
+        hotelData.incomeResetsCardIQD = [];
+        hotelData.outsideIncomeResets = [];
+        hotelData.oiResetsIQD = [];
+        hotelData.oiResetsUSD = [];
+        hotelData.oiResetsCardIQD = [];
+        hotelData.purchasesResets = [];
+        hotelData.purchResetsIQD = [];
+        hotelData.purchResetsUSD = [];
+        hotelData.purchResetsCardIQD = [];
 
-        saveDataToStorage();
-        showToast('Database reset for production — rooms kept, all test activity cleared.', 'success');
+        addActivity('Database reset for production — rooms and Activity Log kept, all other data cleared');
+        showToast('Database reset for production — rooms and Activity Log kept, everything else cleared.', 'success');
         loadSettingsPage();
     }).catch(() => {
         showToast('Reset failed — could not verify the user list. Nothing was changed.', 'error');
