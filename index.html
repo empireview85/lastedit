@@ -26,6 +26,11 @@
         });
         window.fbDb   = firebase.database();
         window.fbAuth = firebase.auth();
+        // No persisted session across page loads — reopening the browser or refreshing the page
+        // must always show the login screen and require typing credentials again. Without this,
+        // Firebase's default (IndexedDB-backed) persistence silently signs staff back in on every
+        // visit, which is exactly what made shifts keep reusing stale sessions from days earlier.
+        window.fbAuth.setPersistence(firebase.auth.Auth.Persistence.NONE).catch(() => {});
     </script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
