@@ -623,10 +623,6 @@ document.addEventListener('DOMContentLoaded', function() {
                     return window.fbDb.ref('hotelData').once('value').then(dataSnap => {
                         const fbData = dataSnap.val();
                         if (fbData) { hotelData = fbMerge(fbData); localStorage.setItem('hotelData', JSON.stringify(hotelData)); }
-                        // A restored session (tab left open, tablet just woke up, etc.) never goes
-                        // through the login form, so roll the shift over here if the open one is
-                        // clearly stale — see ensureFreshShiftSession().
-                        if (loggedInUser.role === 'reception' || loggedInUser.role === 'admin') ensureFreshShiftSession();
                         showApp();
                         setupFirebaseRealtimeListener();
                     });
@@ -1411,6 +1407,7 @@ function calculateTotalPrice() {
 function handleCheckIn(e) {
     e.preventDefault();
     if (!requireOnline()) return;
+    if (!requireActiveShift()) return;
     const roomId = parseInt(document.getElementById('roomSelect').value);
     const room = hotelData.rooms.find(r => r.id === roomId);
 
@@ -1646,22 +1643,26 @@ function loadCheckOutForm(roomId) {
     // Determine room currency
     const roomIsUSD = (guest.basePriceUSD > 0);
     const roomSymbol = roomIsUSD ? '$' : 'IQD';
-    let finalPrice = roomIsUSD ? (guest.basePriceUSD || 0) : (guest.basePriceIQD || guest.basePrice || 0);
-    if (guest.discountType === 'percentage' && guest.discount) {
-        finalPrice = finalPrice - (finalPrice * guest.discount / 100);
-    } else if (guest.discount) {
-        finalPrice = finalPrice - guest.discount;
-    }
-    finalPrice = Math.max(0, finalPrice);
-
-    const roomCharges = finalPrice * nights;
-    // Services always in IQD
-    const serviceTotal = guest.orders.reduce((sum, order) => sum + (order.price * order.quantity), 0);
+    const finalPrice = roomIsUSD ? (guest.basePriceUSD || 0) : (guest.basePriceIQD || guest.basePrice || 0);
 
     // Balance due after deposit (room charges + services - deposit already paid)
     // Everything is converted to a single IQD figure using the exchange rate, so USD and IQD
     // amounts (room price, deposit, services, payment) can be compared/combined directly.
     const rate = hotelData.settings.exchangeRate || 1500;
+
+    // Discount is always entered in IQD, as a flat amount off the whole stay's room total (not
+    // per night, not a percentage) — deducted in IQD terms regardless of whether the room itself is
+    // priced in USD or IQD, then converted back so roomCharges stays in the room's own currency for
+    // everything downstream (balance math, the invoice line, confirmCheckOut's arguments, printing).
+    const discountIQD = guest.discountIQD || 0;
+    const roomChargesBeforeDiscount = finalPrice * nights;
+    const roomChargesBeforeDiscountIQD = roomIsUSD ? roomChargesBeforeDiscount * rate : roomChargesBeforeDiscount;
+    const roomChargesIQDAfterDiscount = Math.max(0, roomChargesBeforeDiscountIQD - discountIQD);
+    const roomCharges = roomIsUSD ? roomChargesIQDAfterDiscount / rate : roomChargesIQDAfterDiscount;
+
+    // Services always in IQD
+    const serviceTotal = guest.orders.reduce((sum, order) => sum + (order.price * order.quantity), 0);
+
     const depositIQD = guest.depositIQD || 0;
     const depositUSD = guest.depositUSD || 0;
     const roomChargeIQD = roomIsUSD ? roomCharges * rate : roomCharges;
@@ -1744,6 +1745,20 @@ function loadCheckOutForm(roomId) {
         </div>
 
         <div class="mb-5">
+            <h4 class="text-lg font-bold text-gray-800 mb-2"><i class="fas fa-percent mr-2 text-amber-600"></i>Discount</h4>
+            <p class="text-xs text-gray-500 mb-2">Flat amount off the room total, always in IQD (e.g. 1,000 / 5,000 / 10,000) — never a percentage, never per night.</p>
+            <div style="position:relative;max-width:240px;">
+                <span style="position:absolute;left:14px;top:50%;transform:translateY(-50%);color:#6b7280;font-weight:600;font-size:0.85rem;">IQD</span>
+                <input type="text" inputmode="numeric" id="checkoutDiscountIQD"
+                    value="${discountIQD > 0 ? Math.round(discountIQD).toLocaleString('en-US') : ''}"
+                    placeholder="0" style="padding-left:52px;"
+                    class="w-full px-3 py-2 border-2 border-gray-200 rounded-lg focus:outline-none focus:border-amber-500"
+                    oninput="this.value=this.value.replace(/[^0-9]/g,'').replace(/\\B(?=(\\d{3})+(?!\\d))/g,',')"
+                    onchange="applyCheckoutDiscount(${roomId}, this.value)">
+            </div>
+        </div>
+
+        <div class="mb-5">
             <h4 class="text-lg font-bold text-gray-800 mb-3">${t('invoice_summary')}</h4>
             <table class="w-full text-sm border-collapse">
                 <thead>
@@ -1756,10 +1771,15 @@ function loadCheckOutForm(roomId) {
                     <!-- Room charges in room currency -->
                     <tr class="border-b border-gray-200">
                         <td class="py-2">${t('room_charges')} (${nights} ${t('nights_label')} × ${roomSymbol} ${roomSymbol==='IQD'?fmtIQD(finalPrice):finalPrice.toLocaleString()}/${t('per_night')})</td>
-                        <td class="text-right py-2 font-semibold">${roomSymbol} ${roomSymbol==='IQD'?fmtIQD(roomCharges):roomCharges.toLocaleString()}</td>
+                        <td class="text-right py-2 font-semibold">${roomSymbol} ${roomSymbol==='IQD'?fmtIQD(roomChargesBeforeDiscount):roomChargesBeforeDiscount.toLocaleString()}</td>
                     </tr>
+                    ${discountIQD > 0 ? `
+                    <tr class="border-b border-gray-200">
+                        <td class="py-2 text-amber-700"><i class="fas fa-percent mr-1"></i>Discount</td>
+                        <td class="text-right py-2 font-semibold text-amber-700">- IQD ${fmtIQD(discountIQD)}</td>
+                    </tr>` : ''}
                     <tr class="bg-blue-50 border-b-2 border-blue-200">
-                        <td class="py-2 font-bold">${t('room_charges')} ${t('grand_total_label')}</td>
+                        <td class="py-2 font-bold">${t('room_charges')} ${t('grand_total_label')}${discountIQD > 0 ? ' (after discount)' : ''}</td>
                         <td class="text-right py-2 font-bold text-blue-700">${roomSymbol} ${roomSymbol==='IQD'?fmtIQD(roomCharges):roomCharges.toLocaleString()}</td>
                     </tr>
                     ${guest.orders.length > 0 ? `
@@ -1868,6 +1888,7 @@ function loadCheckOutForm(roomId) {
 
 function confirmCheckOut(roomId, roomAmount, roomSymbol, serviceAmountIQD) {
     if (!requireOnline()) return;
+    if (!requireActiveShift()) return;
     const room = hotelData.rooms.find(r => r.id === roomId);
     if (!room || !room.currentGuest) return;
     const guest = hotelData.guests.find(g => g.id === room.currentGuest.id);
@@ -1929,6 +1950,9 @@ function confirmCheckOut(roomId, roomAmount, roomSymbol, serviceAmountIQD) {
     guest.refundCardIQD  = refundCardIQD;
     guest.balanceIQD = balanceIQD;
     guest.balanceUSD = balanceUSD;
+    // Snapshot the pre-discount room total in IQD so History/Reports can always show a clean
+    // "before → after" even though roomAmountPaid above is already net of the discount.
+    guest.roomChargesBeforeDiscountIQD = roomChargeIQD + (guest.discountIQD || 0);
 
     // Temp-occupied rooms still need cleaning like any other checkout — restore the pending
     // reservation info so reception doesn't lose it, but let the cleaner see it as a checkout.
@@ -1945,7 +1969,10 @@ function confirmCheckOut(roomId, roomAmount, roomSymbol, serviceAmountIQD) {
     const refundNote = (refundCashIQD > 0 || refundCashUSD > 0 || refundCardIQD > 0)
         ? ` - refunded ${[refundCashIQD>0?`IQD ${fmtIQD(refundCashIQD)}`:'', refundCashUSD>0?`$${refundCashUSD.toFixed(2)}`:'', refundCardIQD>0?`MasterCard IQD ${fmtIQD(refundCardIQD)}`:''].filter(Boolean).join(' + ')} to guest`
         : '';
-    addActivity(`Guest ${guest.name} checked out from Room ${room.number} - ${roomSymbol} ${roomAmtFmt}${svcNote}${refundNote}`);
+    const discountNote = (guest.discountIQD || 0) > 0
+        ? ` (discount of IQD ${fmtIQD(guest.discountIQD)} applied, was IQD ${fmtIQD(guest.roomChargesBeforeDiscountIQD)})`
+        : '';
+    addActivity(`Guest ${guest.name} checked out from Room ${room.number} - ${roomSymbol} ${roomAmtFmt}${discountNote}${svcNote}${refundNote}`);
     saveDataToStorage();
     showToast(t('toast_checkout_ok'), 'success');
 
@@ -2256,8 +2283,17 @@ function viewGuestDetails(guestId) {
         const collectedIQDEq = depositIQDEq + checkoutIQDEq - refundIQDEq;
         const collected = sym === 'IQD' ? collectedIQDEq : collectedIQDEq / rate;
         roomExpenseHtml = `
+            ${(guest.discountIQD||0) > 0 ? `
             <div class="flex justify-between py-2 text-sm">
-                <span class="text-gray-700">${t('room_charges')}</span>
+                <span class="text-gray-700">${t('room_charges')} <span style="color:#9ca3af;">(before discount)</span></span>
+                <span class="font-semibold text-gray-800">${sym === 'IQD' ? `IQD ${fmtIQD(guest.roomChargesBeforeDiscountIQD||0)}` : `$ ${((guest.roomChargesBeforeDiscountIQD||0)/rate).toFixed(2)} <span style="color:#9ca3af;">(IQD ${fmtIQD(guest.roomChargesBeforeDiscountIQD||0)})</span>`}</span>
+            </div>
+            <div class="flex justify-between py-2 text-sm">
+                <span class="text-amber-700"><i class="fas fa-percent mr-1"></i>Discount</span>
+                <span class="font-semibold text-amber-700">- IQD ${fmtIQD(guest.discountIQD)}</span>
+            </div>` : ''}
+            <div class="flex justify-between py-2 text-sm">
+                <span class="text-gray-700">${t('room_charges')}${(guest.discountIQD||0) > 0 ? ' (after discount)' : ''}</span>
                 <span class="font-semibold text-gray-800">${fmtAmt(amt)}</span>
             </div>
             ${svc > 0 ? `
@@ -2487,10 +2523,12 @@ function openAdminEditModal(kind, refId, orderId = null) {
                 <div class="input-group" style="margin-bottom:0;"><label>Collected MasterCard (IQD)</label>
                     <input type="text" id="aeCoCardIQD" value="${numFmt(guest.checkoutCardIQD)}" ${iqdAttrs}></div>
                 <div></div>
-                <div class="input-group" style="margin-bottom:0;"><label>Room Total Charged (${guest.roomCurrency || 'IQD'})</label>
+                <div class="input-group" style="margin-bottom:0;"><label>Room Total Charged (${guest.roomCurrency || 'IQD'}, after discount)</label>
                     <input type="number" id="aeRoomAmt" step="0.01" min="0" value="${guest.roomAmountPaid || 0}"></div>
                 <div class="input-group" style="margin-bottom:0;"><label>Services Billed (IQD)</label>
                     <input type="text" id="aeSvcIQD" value="${numFmt(guest.serviceAmountIQD)}" ${iqdAttrs}></div>
+                <div class="input-group" style="margin-bottom:0;"><label>Discount Applied (IQD)</label>
+                    <input type="text" id="aeDiscIQD" value="${numFmt(guest.discountIQD)}" ${iqdAttrs}></div>
             </div>
             <p style="font-size:0.78rem;color:#6b7280;margin:14px 0 10px;">Refund given back to the guest (e.g. their deposit covered more than the bill):</p>
             <div class="grid grid-cols-2 gap-3">
@@ -2507,6 +2545,7 @@ function openAdminEditModal(kind, refId, orderId = null) {
             guest.checkoutCardIQD  = parseFloat((document.getElementById('aeCoCardIQD').value || '').replace(/,/g, '')) || 0;
             guest.roomAmountPaid   = parseFloat(document.getElementById('aeRoomAmt').value) || 0;
             guest.serviceAmountIQD = parseFloat((document.getElementById('aeSvcIQD').value || '').replace(/,/g, '')) || 0;
+            guest.discountIQD      = parseFloat((document.getElementById('aeDiscIQD').value || '').replace(/,/g, '')) || 0;
             guest.refundCashIQD    = parseFloat((document.getElementById('aeRefCashIQD').value || '').replace(/,/g, '')) || 0;
             guest.refundCashUSD    = parseFloat(document.getElementById('aeRefCashUSD').value) || 0;
             guest.refundCardIQD    = parseFloat((document.getElementById('aeRefCardIQD').value || '').replace(/,/g, '')) || 0;
@@ -2514,6 +2553,9 @@ function openAdminEditModal(kind, refId, orderId = null) {
             // currency so totalSpent stays consistent with roomAmountPaid/roomCurrency.
             const rate = hotelData.settings.exchangeRate || 1500;
             guest.totalSpent = guest.roomAmountPaid + (guest.roomCurrency === 'IQD' ? guest.serviceAmountIQD : guest.serviceAmountIQD / rate);
+            // Keep the "before discount" snapshot consistent with the corrected amount+discount.
+            const roomAmtIQD = guest.roomCurrency === 'IQD' ? guest.roomAmountPaid : guest.roomAmountPaid * rate;
+            guest.roomChargesBeforeDiscountIQD = roomAmtIQD + guest.discountIQD;
             addActivity(`Admin corrected check-out details for ${guest.name}`);
             return true;
         };
@@ -4364,6 +4406,43 @@ function showToast(message, type = 'success') {
     }, 3000);
 }
 
+// A styled, bilingual (EN/AR, matching whatever language is currently active) confirm/warning
+// dialog — used for the shift-related warnings (start-shift-required, logging out with an open
+// shift, end-shift download prompt) instead of a plain native confirm(), since those moments are
+// meant to actually get read, not reflexively dismissed.
+function showBilingualConfirm({ titleEn, titleAr, bodyEn, bodyAr, okTextEn, okTextAr, cancelTextEn, cancelTextAr, singleButton = false, onOk = null, onCancel = null }) {
+    document.getElementById('bilingualConfirmOverlay')?.remove();
+    const isAr = currentLang === 'ar';
+    const title = isAr ? (titleAr || titleEn) : (titleEn || titleAr);
+    const body = isAr ? (bodyAr || bodyEn) : (bodyEn || bodyAr);
+    const okText = isAr ? (okTextAr || okTextEn || 'موافق') : (okTextEn || okTextAr || 'OK');
+    const cancelText = isAr ? (cancelTextAr || cancelTextEn || 'إلغاء') : (cancelTextEn || cancelTextAr || 'Cancel');
+
+    const overlay = document.createElement('div');
+    overlay.id = 'bilingualConfirmOverlay';
+    overlay.dir = isAr ? 'rtl' : 'ltr';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.62);z-index:10050;display:flex;align-items:center;justify-content:center;padding:20px;';
+    overlay.innerHTML = `
+        <div style="background:#fff;border-radius:18px;max-width:440px;width:100%;overflow:hidden;box-shadow:0 30px 70px rgba(0,0,0,0.4);text-align:center;animation:slideIn 0.25s ease-out;">
+            <div style="background:linear-gradient(135deg,#f59e0b,#d97706);padding:26px 24px 20px;">
+                <div style="width:54px;height:54px;border-radius:50%;background:rgba(255,255,255,0.2);display:flex;align-items:center;justify-content:center;margin:0 auto 12px;">
+                    <i class="fas fa-exclamation-triangle" style="color:#fff;font-size:1.5rem;"></i>
+                </div>
+                <h3 style="color:#fff;font-size:1.15rem;font-weight:800;margin:0;">${title}</h3>
+            </div>
+            <div style="padding:22px 24px;">
+                <p style="color:#374151;font-size:0.94rem;line-height:1.65;margin:0 0 20px;">${body}</p>
+                <div style="display:flex;gap:10px;">
+                    ${!singleButton ? `<button id="bcCancelBtn" style="flex:1;padding:11px;border-radius:10px;border:2px solid #e5e7eb;background:#fff;color:#374151;font-weight:700;cursor:pointer;font-size:0.88rem;">${cancelText}</button>` : ''}
+                    <button id="bcOkBtn" style="flex:1;padding:11px;border-radius:10px;border:none;background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff;font-weight:700;cursor:pointer;font-size:0.88rem;">${okText}</button>
+                </div>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+    document.getElementById('bcOkBtn').onclick = () => { overlay.remove(); if (onOk) onOk(); };
+    document.getElementById('bcCancelBtn')?.addEventListener('click', () => { overlay.remove(); if (onCancel) onCancel(); });
+}
+
 // ==================== AUTH SYSTEM ====================
 function checkAuth() {
     showLogin();
@@ -4449,7 +4528,9 @@ function handleLogin(e) {
         .then(dataSnap => {
             const fbData = dataSnap.val();
             if (fbData) { hotelData = fbMerge(fbData); localStorage.setItem('hotelData', JSON.stringify(hotelData)); }
-            startShiftSession();
+            // No auto-start here — shifts are 100% manual now. Logging in just opens the app; the
+            // person must go to Shift Report and click Start Shift before they can touch check-in,
+            // check-out, purchases, or outside income.
             if (btn) btn.disabled = false;
             showApp();
             setupFirebaseRealtimeListener();
@@ -4489,6 +4570,31 @@ function applyRoleUI() {
 }
 
 // ==================== SHIFT SESSIONS ====================
+// Shifts are entirely manual now — logging in no longer opens one and logging out no longer closes
+// one. Money-affecting actions (check-in, checkout, purchases, outside income) refuse to proceed
+// until the staff member has explicitly clicked "Start Shift" on the Shift Report page, so nothing
+// can ever get silently attributed to no shift (or the wrong one) again.
+function hasOpenShift() {
+    const staff = loggedInUser?.name || loggedInUser?.email || '—';
+    return (hotelData.shiftLog || []).some(s => s.staff === staff && !s.logoutAt);
+}
+
+// Cleaners don't carry a cash vault/shift in this app's model, so they're exempt. Everyone else
+// (reception, admin) must have started a shift before touching money-affecting operations.
+function requireActiveShift() {
+    if (loggedInUser?.role === 'cleaner') return true;
+    if (hasOpenShift()) return true;
+    showBilingualConfirm({
+        titleEn: 'Shift Not Started', titleAr: 'لم تبدأ الوردية بعد',
+        bodyEn: 'Please start a shift to continue with this operation.',
+        bodyAr: 'الرجاء بدء وردية للمتابعة في هذه العملية.',
+        okTextEn: 'Go to Shift Report', okTextAr: 'الذهاب إلى تقرير الوردية',
+        singleButton: true,
+        onOk: () => downloadShiftReport()
+    });
+    return false;
+}
+
 // Tracks actual login→logout sessions per staff member (not calendar days), so a shift that
 // crosses midnight stays together in one report instead of being split across two dates.
 function startShiftSession() {
@@ -4505,51 +4611,6 @@ function startShiftSession() {
     saveDataToStorage();
 }
 
-// Closes the current staff member's open shift. Returns its id (or null if none was open).
-function endShiftSession() {
-    const staff = loggedInUser?.name || loggedInUser?.email || '—';
-    if (!Array.isArray(hotelData.shiftLog)) return null;
-    const open = [...hotelData.shiftLog].reverse().find(s => s.staff === staff && !s.logoutAt);
-    if (!open) return null;
-    open.logoutAt = new Date().toISOString();
-    saveDataToStorage();
-    return open.id;
-}
-
-// Ensures the current staff member always has an open shift to fall back to — covers sessions
-// that were already logged in before this feature existed (no shiftLog entry yet).
-function getOrStartCurrentShift() {
-    const staff = loggedInUser?.name || loggedInUser?.email || '—';
-    if (!Array.isArray(hotelData.shiftLog)) hotelData.shiftLog = [];
-    let open = [...hotelData.shiftLog].reverse().find(s => s.staff === staff && !s.logoutAt);
-    if (!open) {
-        open = { id: Math.random().toString(36).substring(2, 11), staff, loginAt: new Date().toISOString(), logoutAt: null };
-        hotelData.shiftLog.push(open);
-        saveDataToStorage();
-    }
-    return open;
-}
-
-// Firebase keeps an authenticated session alive across page reloads and even across days (that's
-// what onAuthStateChanged auto-restoring is for) — but startShiftSession() only ever ran from the
-// login *form* submit. So a staff member who never explicitly clicks Logout (they just close the
-// tablet, or it goes to sleep) keeps reusing the SAME open shift indefinitely — it can never roll
-// over on its own, which is why a shift opened weeks ago can still show up as "current" today.
-// Called on every auto-restored session: leaves a genuinely still-ongoing shift alone (so page
-// refreshes mid-shift don't fragment it), but closes out anything open for longer than a shift
-// could plausibly run and starts a fresh one, so "current shift" always actually means today.
-const MAX_PLAUSIBLE_SHIFT_HOURS = 18;
-function ensureFreshShiftSession() {
-    const staff = loggedInUser?.name || loggedInUser?.email || '—';
-    if (!Array.isArray(hotelData.shiftLog)) hotelData.shiftLog = [];
-    const open = [...hotelData.shiftLog].reverse().find(s => s.staff === staff && !s.logoutAt);
-    if (!open) { startShiftSession(); return; }
-    const hoursOpen = (Date.now() - new Date(open.loginAt).getTime()) / 3600000;
-    if (hoursOpen > MAX_PLAUSIBLE_SHIFT_HOURS) {
-        startShiftSession(); // closes the stale one and opens a fresh one, same as a real login would
-    }
-}
-
 // Admin shortcut: jump straight to a staff member's open (live, still logged in) session,
 // instead of having to dig through the Month/Shift dropdowns to find the one marked "(current)".
 function jumpToCurrentSession() {
@@ -4561,6 +4622,34 @@ function jumpToCurrentSession() {
         return;
     }
     downloadShiftReport(false, open.id, null, staffName);
+}
+
+// Ends the given shift — asks (bilingual) whether to download the Excel report first, since that
+// used to happen automatically on logout and now never does. Either way the shift closes; the
+// only question is whether a copy gets saved to disk before it does.
+function endCurrentShift(shiftEntry) {
+    if (!shiftEntry || shiftEntry.logoutAt) return;
+    showBilingualConfirm({
+        titleEn: 'End Shift', titleAr: 'إنهاء الوردية',
+        bodyEn: 'Do you want to download your shift report before ending this shift?',
+        bodyAr: 'هل تريد تحميل تقرير ورديتك قبل إنهاء هذه الوردية؟',
+        okTextEn: 'Yes, Download', okTextAr: 'نعم، تحميل',
+        cancelTextEn: 'No, Just End It', cancelTextAr: 'لا، إنهاء فقط',
+        onOk: () => finalizeEndShift(shiftEntry, true),
+        onCancel: () => finalizeEndShift(shiftEntry, false)
+    });
+}
+
+function finalizeEndShift(shiftEntry, download) {
+    shiftEntry.logoutAt = new Date().toISOString();
+    saveDataToStorage();
+    if (download) downloadShiftReport(true, shiftEntry.id);
+    showToast('Shift ended.', 'success');
+    _openShiftReportArgs = null;
+    document.getElementById('shiftReportOverlay')?.remove();
+    // Re-open the report — with the shift now closed, this naturally shows the Start Shift prompt
+    // again, giving clear confirmation the shift actually ended.
+    downloadShiftReport();
 }
 
 function downloadShiftReport(autoExcel = false, shiftId = null, monthKey = null, staffOverride = null) {
@@ -4585,24 +4674,60 @@ function downloadShiftReport(autoExcel = false, shiftId = null, monthKey = null,
 
     // Shifts are tracked by actual login→logout time, not calendar day, so a shift that
     // crosses midnight (e.g. 10pm–6am) stays together as one report instead of being split.
-    // Only auto-open a "current" shift when no specific one was requested — otherwise (e.g. right
-    // after logout just closed it) this would immediately re-open a brand-new duplicate session.
-    // Never auto-open a shift while an admin is just browsing someone else's history.
-    if (!shiftId && isOwnSession) getOrStartCurrentShift();
+    // Nothing here auto-creates a shift anymore — that's now a deliberate "Start Shift" click.
     const allMyShifts = (hotelData.shiftLog || [])
         .filter(s => s.staff === staff)
         .sort((a, b) => new Date(b.loginAt) - new Date(a.loginAt));
+    const myOpenShift = allMyShifts.find(s => !s.logoutAt);
+
+    // Landed here with no specific shift/month requested (i.e. just clicked "Shift Report") and
+    // there's nothing currently open for this person — show a Start Shift prompt instead of a
+    // report, since there's nothing live to report on yet. Browsing a specific past shift/month
+    // still works normally even with no open shift (that's just history).
+    if (!autoExcel && isOwnSession && !shiftId && !monthKey && !myOpenShift) {
+        _openShiftReportArgs = null;
+        document.getElementById('shiftReportOverlay')?.remove();
+        const overlay = document.createElement('div');
+        overlay.id = 'shiftReportOverlay';
+        overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;';
+        const hasHistory = allMyShifts.length > 0;
+        overlay.innerHTML = `
+            <div style="background:#fff;border-radius:18px;max-width:440px;width:100%;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,0.45);text-align:center;">
+                <div style="background:linear-gradient(135deg,#1e3a8a,#2563eb);padding:30px 24px 22px;">
+                    <div style="width:60px;height:60px;border-radius:50%;background:rgba(255,255,255,0.18);display:flex;align-items:center;justify-content:center;margin:0 auto 14px;">
+                        <i class="fas fa-play-circle" style="color:#fff;font-size:1.8rem;"></i>
+                    </div>
+                    <h3 style="color:#fff;font-size:1.25rem;font-weight:800;margin:0;">No Shift Started</h3>
+                </div>
+                <div style="padding:26px 24px;">
+                    <p style="color:#374151;font-size:0.95rem;line-height:1.6;margin:0 0 22px;">
+                        You don't have an open shift right now. Start one to begin tracking check-ins, checkouts, purchases, and outside income for this session.
+                    </p>
+                    <button id="srStartShiftBtn" style="width:100%;padding:13px;border-radius:10px;border:none;background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;font-weight:700;cursor:pointer;font-size:0.95rem;display:flex;align-items:center;justify-content:center;gap:8px;">
+                        <i class="fas fa-play"></i> Start Shift
+                    </button>
+                    ${hasHistory ? `<button id="srViewHistoryBtn" style="width:100%;margin-top:10px;padding:11px;border-radius:10px;border:2px solid #e5e7eb;background:#fff;color:#374151;font-weight:600;cursor:pointer;font-size:0.88rem;">View Past Shifts</button>` : ''}
+                    <button id="srStartCloseBtn" style="width:100%;margin-top:10px;padding:9px;border:none;background:none;color:#9ca3af;font-weight:600;cursor:pointer;font-size:0.85rem;">Close</button>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+        document.getElementById('srStartShiftBtn').onclick = () => { startShiftSession(); showToast('Shift started!', 'success'); downloadShiftReport(); };
+        document.getElementById('srViewHistoryBtn')?.addEventListener('click', () => downloadShiftReport(false, allMyShifts[0].id));
+        document.getElementById('srStartCloseBtn').onclick = () => overlay.remove();
+        return;
+    }
 
     const monthKeyOf   = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
     const monthLabelOf = d => d.toLocaleString([], { month: 'long', year: 'numeric' });
 
     // Resolve which shift we're showing: explicit shift id wins, then a shift inside the
-    // requested month, then fall back to the most recent shift overall.
+    // requested month, then the currently-open one, then just the most recent shift overall.
     let shift = (shiftId && allMyShifts.find(s => s.id === shiftId)) || null;
     if (!shift && monthKey) {
         shift = allMyShifts.find(s => monthKeyOf(new Date(s.loginAt)) === monthKey) || null;
     }
-    if (!shift) shift = allMyShifts[0];
+    if (!shift) shift = myOpenShift || allMyShifts[0];
+    if (!shift) { showToast('No shift data found.', 'error'); return; }
     const isLiveSession = !shift.logoutAt; // staff is logged in right now, viewing this session live
 
     const activeMonthKey = monthKeyOf(new Date(shift.loginAt));
@@ -4966,6 +5091,10 @@ function downloadShiftReport(autoExcel = false, shiftId = null, monthKey = null,
                     </div>
                 </div>
                 <div style="display:flex;gap:10px;align-items:center;">
+                    ${isOwnSession && isLiveSession ? `<button id="srEndShiftBtn" style="background:#dc2626;color:#fff;border:none;border-radius:8px;
+                            padding:8px 16px;font-weight:600;cursor:pointer;font-size:13px;display:flex;align-items:center;gap:6px;">
+                        <i class="fas fa-stop-circle"></i> End Shift
+                    </button>` : ''}
                     <button id="srExcelBtn" style="background:#10b981;color:#fff;border:none;border-radius:8px;
                             padding:8px 16px;font-weight:600;cursor:pointer;font-size:13px;display:flex;align-items:center;gap:6px;">
                         <i class="fas fa-file-excel"></i> Download Excel
@@ -4991,6 +5120,7 @@ function downloadShiftReport(autoExcel = false, shiftId = null, monthKey = null,
     document.getElementById('srMonthSelect').onchange = (e) => downloadShiftReport(false, null, e.target.value, staff);
     document.getElementById('srStaffSelect')?.addEventListener('change', (e) => downloadShiftReport(false, null, null, e.target.value));
     document.getElementById('srCurrentBtn')?.addEventListener('click', jumpToCurrentSession);
+    document.getElementById('srEndShiftBtn')?.addEventListener('click', () => endCurrentShift(shift));
 
     document.getElementById('srExcelBtn').onclick = () => {
         const tableHtml = buildTableHtml(false);
@@ -5028,11 +5158,30 @@ function downloadShiftReport(autoExcel = false, shiftId = null, monthKey = null,
 }
 
 function logout() {
-    if (!confirm(t('logout_confirm') || 'Are you sure you want to logout?')) return;
-    if (loggedInUser && (loggedInUser.role === 'reception' || loggedInUser.role === 'admin')) {
-        const closedShiftId = endShiftSession();
-        downloadShiftReport(true, closedShiftId);
+    // Shifts are manual now — logging out never auto-ends one. But leaving a shift open when you
+    // walk away is exactly the mistake this whole redesign is meant to prevent, so warn (bilingual)
+    // and give a one-click way to go end it properly instead, before falling through to the normal
+    // logout confirmation.
+    const shiftOpen = loggedInUser
+        && (loggedInUser.role === 'reception' || loggedInUser.role === 'admin')
+        && hasOpenShift();
+    if (shiftOpen) {
+        showBilingualConfirm({
+            titleEn: 'Shift Still Open', titleAr: 'الوردية لا تزال مفتوحة',
+            bodyEn: "You're about to log out without ending your shift. It's recommended to end your shift first so it's properly recorded.",
+            bodyAr: 'أنت على وشك تسجيل الخروج دون إنهاء ورديتك. يُنصح بإنهاء ورديتك أولاً حتى يتم تسجيلها بشكل صحيح.',
+            okTextEn: 'Go to Shift Report', okTextAr: 'الذهاب إلى تقرير الوردية',
+            cancelTextEn: 'Log Out Anyway', cancelTextAr: 'تسجيل الخروج على أي حال',
+            onOk: () => downloadShiftReport(),
+            onCancel: () => proceedLogout()
+        });
+        return;
     }
+    proceedLogout();
+}
+
+function proceedLogout() {
+    if (!confirm(t('logout_confirm') || 'Are you sure you want to logout?')) return;
     if (window.fbDb) window.fbDb.ref('hotelData').off();
     window.fbAuth.signOut().then(() => {
         sessionStorage.removeItem('loggedInUser');
@@ -5224,6 +5373,26 @@ function modifyCheckoutDate(roomId, newDateString) {
     // Reload the checkout form with updated pricing
     loadCheckOutForm(roomId);
     showToast(t('toast_checkout_updated'), 'success');
+}
+
+// Flat, IQD-only discount off the room total (never per-night, never a percentage) — stored on the
+// guest so it survives into History/Reports/the Activity Log as a clear before → after record.
+function applyCheckoutDiscount(roomId, value) {
+    const room = hotelData.rooms.find(r => r.id === roomId);
+    const guest = hotelData.guests.find(g => g.id === room?.currentGuest?.id);
+    if (!room || !guest) return;
+
+    const discountIQD = parseFloat(String(value || '').replace(/,/g, '')) || 0;
+    const before = guest.discountIQD || 0;
+    guest.discountIQD = discountIQD;
+
+    if (discountIQD !== before) {
+        addActivity(`Discount of IQD ${fmtIQD(discountIQD)} applied at checkout for ${guest.name} — Room ${room.number}`);
+    } else {
+        saveDataToStorage();
+    }
+
+    loadCheckOutForm(roomId);
 }
 
 // Function to remove an accidentally added order
@@ -5982,6 +6151,7 @@ function loadPurchasesPage() {
 function handlePurchaseSubmit(e) {
     e.preventDefault();
     if (!requireOnline()) return;
+    if (!requireActiveShift()) return;
     const name = document.getElementById('purchaseName').value.trim();
     const priceIQD     = parseFloat((document.getElementById('purchasePriceIQD').value || '').replace(/,/g, '')) || 0;
     const priceUSD     = parseFloat(document.getElementById('purchasePriceUSD').value) || 0;
@@ -6056,6 +6226,7 @@ function loadOutsideIncomePage() {
 function handleOutsideIncomeSubmit(e) {
     e.preventDefault();
     if (!requireOnline()) return;
+    if (!requireActiveShift()) return;
     const name         = document.getElementById('outsideIncomeName').value.trim();
     const priceIQD     = parseFloat((document.getElementById('outsideIncomePriceIQD').value || '').replace(/,/g, '')) || 0;
     const priceUSD     = parseFloat(document.getElementById('outsideIncomePriceUSD').value) || 0;
@@ -6277,7 +6448,6 @@ function handleFirstRun(e) {
                 .then(() => window.fbDb.ref('hotelData').set(hotelData));
         })
         .then(() => {
-            startShiftSession();
             if (btn) btn.disabled = false;
             document.getElementById('firstRunOverlay').style.display = 'none';
             showApp();
