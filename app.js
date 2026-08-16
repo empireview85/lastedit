@@ -498,9 +498,20 @@ function migrateRoomStatuses(rooms, rawStatuses) {
     });
 }
 
-function getStatusConfig(id) {
+// `room` is optional — pass it when rendering a specific room card so a Group booking (no guest
+// details, no charges) can be tinted with its own configurable color instead of blending into the
+// same "Occupied" color as a normal paying guest. Every other caller that just needs a status's
+// label/bookable flag (not a specific room's card) can keep calling this with only the id.
+function getStatusConfig(id, room = null) {
     const found = (hotelData.settings.roomStatuses || []).find(s => s.id === id);
-    return found || { id, label: id, color: '#6b7280', bookable: false };
+    const base = found || { id, label: id, color: '#6b7280', bookable: false };
+    if (room && id === 'occupied' && room.currentGuest) {
+        const guest = hotelData.guests.find(g => g.id === room.currentGuest.id);
+        if (guest?.isGroup) {
+            return { ...base, color: hotelData.settings.groupColor || '#8b5cf6' };
+        }
+    }
+    return base;
 }
 
 function getStatusLabel(id) {
@@ -550,6 +561,7 @@ let hotelData = {
         taxRate: 0,
         exchangeRate: 1500,
         checkoutCutoffHour: 13, // 1:00 PM — staying past this on the checkout date auto-adds another night
+        groupColor: '#8b5cf6', // room-card color for Group check-ins, kept distinct from the normal Occupied color
         paymentMethods: ['Cash', 'Card', 'Bank Transfer'],
         serviceCategories: [
             {en:'Food',ar:'طعام'},
@@ -935,7 +947,7 @@ function displayRooms(rooms) {
     grid.innerHTML = '';
 
     rooms.forEach(room => {
-        const cfg = getStatusConfig(room.status);
+        const cfg = getStatusConfig(room.status, room);
         const card = document.createElement('div');
         card.className = 'room-card bg-white rounded-lg p-6 cursor-pointer hover:shadow-lg transition-all';
         card.style.cssText = `border-left:4px solid ${cfg.color};`;
@@ -1058,7 +1070,7 @@ function displayCheckInRooms(rooms) {
     grid.innerHTML = '';
 
     rooms.forEach(room => {
-        const cfg = getStatusConfig(room.status);
+        const cfg = getStatusConfig(room.status, room);
         const isAvailable = cfg.bookable;
         // Based on reservationInfo, not status — so a temp-checked-out room still shows its
         // pending reservation even while sitting in "Checkout" (needs cleaning) for the cleaner.
@@ -1411,7 +1423,7 @@ function handleCheckIn(e) {
     const roomId = parseInt(document.getElementById('roomSelect').value);
     const room = hotelData.rooms.find(r => r.id === roomId);
 
-    const roomCfg = getStatusConfig(room.status);
+    const roomCfg = getStatusConfig(room.status, room);
     if (!room || (!roomCfg.bookable && room.status !== 'reserved')) {
         showToast(t('toast_room_unavailable'), 'error');
         return;
@@ -1521,7 +1533,7 @@ function handleCheckIn(e) {
 function groupCheckIn(roomId) {
     if (!requireOnline()) return;
     const room = hotelData.rooms.find(r => r.id === roomId);
-    const roomCfg = getStatusConfig(room.status);
+    const roomCfg = getStatusConfig(room.status, room);
     if (!room || (!roomCfg.bookable && room.status !== 'reserved')) {
         showToast(t('toast_room_unavailable'), 'error');
         return;
@@ -3427,6 +3439,9 @@ function loadSettingsPage() {
     const rateEl = document.getElementById('settingsExchangeRate');
     if (rateEl) rateEl.value = Math.round(hotelData.settings.exchangeRate || 1500).toLocaleString('en-US');
 
+    const groupColorEl = document.getElementById('settingsGroupColor');
+    if (groupColorEl) groupColorEl.value = hotelData.settings.groupColor || '#8b5cf6';
+
     const cutoffEl = document.getElementById('settingsCheckoutCutoffHour');
     if (cutoffEl) {
         const fmtHour = h => { const d = new Date(2000,0,1,h,0,0); return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); };
@@ -3508,6 +3523,9 @@ function saveSettings() {
 
     const cutoffEl = document.getElementById('settingsCheckoutCutoffHour');
     if (cutoffEl && cutoffEl.value !== '') hotelData.settings.checkoutCutoffHour = parseInt(cutoffEl.value);
+
+    const groupColorEl = document.getElementById('settingsGroupColor');
+    if (groupColorEl && groupColorEl.value) hotelData.settings.groupColor = groupColorEl.value;
 
     // Read edited category names from DOM inputs
     const catRows = document.querySelectorAll('#serviceCategories > div');
@@ -3630,7 +3648,7 @@ function loadCleanerPage() {
     }
 
     grid.innerHTML = rooms.map(room => {
-        const cfg  = getStatusConfig(room.status);
+        const cfg  = getStatusConfig(room.status, room);
         const icon = getStatusIcon(room.status);
         // Cleaner dropdown — only non-system statuses
         const opts = cleanerStatuses.map(s =>
@@ -5299,7 +5317,7 @@ function viewRoomDetails(roomId) {
     const room = hotelData.rooms.find(r => r.id === roomId);
     if (!room) return;
 
-    const cfg = getStatusConfig(room.status);
+    const cfg = getStatusConfig(room.status, room);
     const locale = currentLang === 'ar' ? 'ar-IQ' : 'en-US';
     const statusLabel = cfg.label;
     let guestHtml = '';
@@ -5991,7 +6009,7 @@ function displayServiceRooms(rooms) {
 
     rooms.forEach(room => {
         const isOccupied = room.status === 'occupied';
-        const cfg = getStatusConfig(room.status);
+        const cfg = getStatusConfig(room.status, room);
 
         const card = document.createElement('div');
         card.className = `room-card bg-white rounded-lg p-6 ${isOccupied ? 'cursor-pointer' : 'opacity-60 cursor-not-allowed'}`;
