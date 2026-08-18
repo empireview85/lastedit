@@ -2439,6 +2439,77 @@ function closeAdminEditOverlay() {
     document.getElementById('adminEditOverlay')?.remove();
 }
 
+// Numeric/text fields worth tracking as an audited "correction" when an admin edits them — i.e.
+// fields that feed shift-report totals or otherwise matter to the receptionist who entered them.
+// guestinfo isn't listed here since none of its fields are money and it doesn't affect any total.
+const AE_FIELD_LABELS = {
+    order:    { name: 'Name', quantity: 'Quantity', price: 'Unit Price (IQD)' },
+    checkin:  { depositCashIQD: 'Deposit Cash (IQD)', depositCashUSD: 'Deposit Cash ($)', depositCardIQD: 'Deposit MasterCard (IQD)', basePriceIQD: 'Room Price/Night (IQD)', basePriceUSD: 'Room Price/Night ($)' },
+    checkout: { checkoutCashIQD: 'Collected Cash (IQD)', checkoutCashUSD: 'Collected Cash ($)', checkoutCardIQD: 'Collected MasterCard (IQD)', roomAmountPaid: 'Room Total Charged', serviceAmountIQD: 'Services Billed (IQD)', discountIQD: 'Discount (IQD)', refundCashIQD: 'Refunded Cash (IQD)', refundCashUSD: 'Refunded Cash ($)', refundCardIQD: 'Refunded MasterCard (IQD)' },
+    purchase:      { name: 'Name', priceIQD: 'Cash (IQD)', priceUSD: 'Cash ($)', priceCardIQD: 'MasterCard (IQD)' },
+    outsideIncome: { name: 'Name', priceIQD: 'Cash (IQD)', priceUSD: 'Cash ($)', priceCardIQD: 'MasterCard (IQD)' }
+};
+
+// Diffs `target` (post-save) against `before` (a shallow snapshot taken pre-save) for whichever
+// fields matter for `kind`, and — if anything actually changed — logs a structured correction
+// entry (read by the Shift Report and the Excel export so both the receptionist and the admin can
+// see exactly what was entered originally vs. what the admin changed it to) plus a matching
+// Activity Log line. This replaces the old generic "Admin corrected X" line for these kinds, since
+// the specific old→new values are strictly more useful and this is the only place the diff exists.
+function recordCorrection(kind, target, before, guestCtx) {
+    const fieldLabels = AE_FIELD_LABELS[kind];
+    if (!fieldLabels || !target || !before) return;
+    const changes = [];
+    Object.keys(fieldLabels).forEach(f => {
+        const oldV = before[f], newV = target[f];
+        const isNum = typeof newV === 'number' || typeof oldV === 'number';
+        const changed = isNum
+            ? Math.round((parseFloat(oldV) || 0) * 100) !== Math.round((parseFloat(newV) || 0) * 100)
+            : String(oldV || '') !== String(newV || '');
+        if (changed) changes.push({ field: f, label: fieldLabels[f], oldValue: oldV, newValue: newV, isNum });
+    });
+    if (!changes.length) return;
+
+    let staffName = '—', guestName = '', roomNumber = '', originalAt = null;
+    if (kind === 'order') {
+        staffName = target.addedBy || guestCtx?.checkedInBy || '—';
+        guestName = guestCtx?.name || '';
+        originalAt = target.timestamp || guestCtx?.checkIn;
+        const room = hotelData.rooms.find(r => r.currentGuest?.id === guestCtx?.id) || hotelData.rooms.find(r => r.id === guestCtx?.roomId);
+        roomNumber = room?.number || '';
+    } else if (kind === 'checkin') {
+        staffName = guestCtx.checkedInBy || '—';
+        guestName = guestCtx.name || '';
+        originalAt = guestCtx.checkInRecordedAt || guestCtx.checkIn;
+        const room = hotelData.rooms.find(r => r.currentGuest?.id === guestCtx.id) || hotelData.rooms.find(r => r.id === guestCtx.roomId);
+        roomNumber = room?.number || '';
+    } else if (kind === 'checkout') {
+        staffName = guestCtx.checkedOutBy || '—';
+        guestName = guestCtx.name || '';
+        originalAt = guestCtx.checkedOutAt;
+        const room = hotelData.rooms.find(r => r.id === guestCtx.roomId) || hotelData.rooms.find(r => r.currentGuest?.id === guestCtx.id);
+        roomNumber = room?.number || '';
+    } else if (kind === 'purchase' || kind === 'outsideIncome') {
+        staffName = target.addedBy || '—';
+        originalAt = target.date;
+    }
+
+    if (!Array.isArray(hotelData.correctionLog)) hotelData.correctionLog = [];
+    hotelData.correctionLog.push({
+        id: 'corr_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+        timestamp: new Date().toISOString(),
+        adminName: loggedInUser?.name || '—',
+        staffName, guestName, roomNumber, kind, originalAt, changes
+    });
+    if (hotelData.correctionLog.length > 1000) hotelData.correctionLog = hotelData.correctionLog.slice(-1000);
+
+    const fmtVal = v => Math.round(v || 0).toLocaleString('en-US');
+    const summary = changes.map(c => `${c.label}: ${c.isNum ? fmtVal(c.oldValue) : (c.oldValue || '—')} → ${c.isNum ? fmtVal(c.newValue) : (c.newValue || '—')}`).join('; ');
+    const who = guestName ? ` for ${guestName}` : '';
+    const originalByNote = staffName && staffName !== '—' ? ` (originally entered by ${staffName})` : '';
+    addActivity(`Admin corrected ${kind}${who}${originalByNote}: ${summary}`, roomNumber || null, 'action', null, guestName || null);
+}
+
 // `refId` is a guest id for kinds order/checkin/checkout/guestinfo, or an array index into
 // hotelData.purchases/outsideIncome for those two kinds — the two id spaces never mix per call.
 function openAdminEditModal(kind, refId, orderId = null) {
@@ -2485,7 +2556,6 @@ function openAdminEditModal(kind, refId, orderId = null) {
             order.name = name;
             order.quantity = qty;
             order.price = price;
-            addActivity(`Admin corrected service "${name}" for ${guest.name}`);
             return true;
         };
     } else if (kind === 'checkin') {
@@ -2519,7 +2589,6 @@ function openAdminEditModal(kind, refId, orderId = null) {
             guest.basePriceIQD = priceIQD;
             guest.basePriceUSD = priceUSD;
             guest.basePrice = priceIQD || priceUSD;
-            addActivity(`Admin corrected check-in details for ${guest.name}`);
             return true;
         };
     } else if (kind === 'checkout') {
@@ -2568,7 +2637,6 @@ function openAdminEditModal(kind, refId, orderId = null) {
             // Keep the "before discount" snapshot consistent with the corrected amount+discount.
             const roomAmtIQD = guest.roomCurrency === 'IQD' ? guest.roomAmountPaid : guest.roomAmountPaid * rate;
             guest.roomChargesBeforeDiscountIQD = roomAmtIQD + guest.discountIQD;
-            addActivity(`Admin corrected check-out details for ${guest.name}`);
             return true;
         };
     } else if (kind === 'guestinfo') {
@@ -2653,7 +2721,6 @@ function openAdminEditModal(kind, refId, orderId = null) {
             entry.priceUSD = usd;
             entry.priceCardIQD = card;
             entry.notes = document.getElementById('aeENotes').value.trim();
-            addActivity(`Admin corrected ${kind === 'purchase' ? 'purchase' : 'outside income'} "${name}"`);
             return true;
         };
         afterSave = () => kind === 'purchase' ? loadPurchasesPage() : loadOutsideIncomePage();
@@ -2688,7 +2755,12 @@ function openAdminEditModal(kind, refId, orderId = null) {
         } else if (kind === 'purchase' || kind === 'outsideIncome') {
             entry = (kind === 'purchase' ? (hotelData.purchases || []) : (hotelData.outsideIncome || []))[refId] || entry;
         }
+        // Snapshot the audited fields before onSave() mutates them in place, so they can be
+        // diffed afterward — see recordCorrection().
+        const target = kind === 'order' ? order : (kind === 'purchase' || kind === 'outsideIncome') ? entry : guest;
+        const before = AE_FIELD_LABELS[kind] && target ? { ...target } : null;
         if (onSave() === false) return;
+        if (before) recordCorrection(kind, target, before, guest);
         saveDataToStorage();
         showToast('Updated successfully.', 'success');
         closeAdminEditOverlay();
@@ -2704,10 +2776,16 @@ function adminDeleteOrder(guestId, orderId) {
     const idx = guest.orders.findIndex(o => o.id === orderId);
     if (idx === -1) return;
     if (!confirm(`Delete "${guest.orders[idx].name}" from ${guest.name}'s services? This cannot be undone.`)) return;
-    const name = guest.orders[idx].name;
+    const order = guest.orders[idx];
+    const name = order.name;
+    const total = (order.price || 0) * (order.quantity || 1);
     guest.orders.splice(idx, 1);
+    // Logged as a correction (old total → 0) the same way an edit would be, so it shows up in the
+    // originating receptionist's shift report and the admin's export — a mistaken service removed
+    // entirely is functionally the same "receptionist entered it, admin took it back out" case as
+    // editing its price down, just via delete instead of the edit modal.
+    recordCorrection('order', { name, quantity: order.quantity, price: 0, addedBy: order.addedBy, timestamp: order.timestamp }, order, guest);
     saveDataToStorage();
-    addActivity(`Admin deleted service "${name}" for ${guest.name}`);
     showToast('Service deleted.', 'success');
     viewGuestDetails(guestId);
 }
@@ -5010,6 +5088,39 @@ function downloadShiftReport(autoExcel = false, shiftId = null, monthKey = null,
         h += sub(['','','SUBTOTAL', purchCashIQDShift>0?`- IQD ${fmtIQD(purchCashIQDShift)}`:'—', purchUSD>0?`- $${fmtUSD(purchUSD)}`:'—', purchCardIQDShift>0?`- IQD ${fmtIQD(purchCardIQDShift)}`:'—', '', '']);
         h += `<tr><td colspan="8" style="padding:6px;"></td></tr>`;
 
+        // ADMIN CORRECTIONS — edits/deletions an admin made to numbers this staff member
+        // originally entered. Matched to this shift by the *original* record's timestamp (when
+        // the receptionist entered it), not when the admin made the correction, so it lands on
+        // the shift being audited even if the correction itself happened later. The totals above
+        // already reflect the corrected (current) values — this section just makes visible what
+        // changed and who changed it, so a number not matching what the receptionist remembers
+        // entering isn't a mystery to either of them.
+        const correctionsToday = (hotelData.correctionLog || []).filter(c => byMe(c.staffName) && inShift(c.originalAt));
+        h += shead('Admin Corrections Applied', 8);
+        h += `<tr>${['#','Guest / Item','Room','Field','Originally Entered','Corrected To','Corrected By','When'].map(v=>hcell(v)).join('')}</tr>`;
+        if (correctionsToday.length) {
+            let corrRow = 0;
+            correctionsToday.forEach(c => {
+                c.changes.forEach(ch => {
+                    corrRow++;
+                    const oldDisp = ch.isNum ? `IQD ${fmtIQD(ch.oldValue)}` : (ch.oldValue || '—');
+                    const newDisp = ch.isNum ? `IQD ${fmtIQD(ch.newValue)}` : (ch.newValue || '—');
+                    h += `<tr>
+                        ${cell(corrRow)}
+                        ${cell(c.guestName || '—')}
+                        ${cell(c.roomNumber?`Room ${c.roomNumber}`:'—')}
+                        ${cell(ch.label)}
+                        <td style="padding:6px 8px;border:1px solid #ddd;background:#fef2f2;color:#dc2626;text-decoration:line-through;">${esc(oldDisp)}</td>
+                        <td style="padding:6px 8px;border:1px solid #ddd;background:#f0fdf4;color:#15803d;font-weight:700;">${esc(newDisp)}</td>
+                        ${cell(c.adminName)}
+                        ${cell(new Date(c.timestamp).toLocaleString())}
+                    </tr>`;
+                });
+            });
+            h += `<tr><td colspan="8" style="padding:6px 8px;font-style:italic;color:#92400e;background:${C.note};">These figures were corrected by an admin after being entered — the totals above already reflect the corrected values.</td></tr>`;
+        } else { h += empty('No admin corrections during this shift', 8); }
+        h += `<tr><td colspan="8" style="padding:6px;"></td></tr>`;
+
         // VAULT SUMMARY
         h += `<tr><td colspan="8" style="padding:11px 10px;font-weight:700;color:#fff;background:${C.vHdr};font-size:13px;text-align:center;letter-spacing:1px;text-transform:uppercase;">Vault Summary — Net Total</td></tr>`;
         h += `<tr><td colspan="8" style="padding:4px;"></td></tr>`;
@@ -5768,6 +5879,28 @@ function executeExport() {
             addSheet('Activity Log', rows, [4,20,42,16,12,8,14,12]);
         }
 
+        // ── ADMIN CORRECTIONS ── numbers a receptionist entered that an admin later changed —
+        // e.g. a mistaken extra charge added to the wrong room and then removed. Filtered to the
+        // "Corrected By User" side of the User filter — i.e. shows corrections made TO that
+        // person's entries, not corrections made BY them (an admin's own name in the User filter
+        // would otherwise show nothing here, since admins don't correct their own work this way).
+        if (sel('exp_corrections')) {
+            const corrections = (hotelData.correctionLog || []).filter(c => inRange(c.timestamp) && userMatch(c.staffName));
+            const rows = [['#','Originally Entered By','Corrected By (Admin)','Guest / Item','Room','Field','Originally Entered','Corrected To','Originally Entered At','Corrected At']];
+            let n = 0;
+            corrections.forEach(c => {
+                c.changes.forEach(ch => {
+                    n++;
+                    rows.push([n, c.staffName||'—', c.adminName||'—', c.guestName||'—', c.roomNumber?`Room ${c.roomNumber}`:'—',
+                        ch.label, ch.isNum?`IQD ${fmtIQD(ch.oldValue)}`:(ch.oldValue||'—'), ch.isNum?`IQD ${fmtIQD(ch.newValue)}`:(ch.newValue||'—'),
+                        c.originalAt?new Date(c.originalAt).toLocaleString():'—',
+                        c.timestamp?new Date(c.timestamp).toLocaleString():'—']);
+                });
+            });
+            if (rows.length===1) rows.push(['No admin corrections in this period']);
+            addSheet('Admin Corrections', rows, [4,18,18,18,10,20,18,18,20,20]);
+        }
+
         if (wb.SheetNames.length===0) { showToast('Select at least one report type.','error'); return; }
 
         const uTag = userFilter!=='all' ? `-${userFilter.replace(/\s+/g,'_')}` : '';
@@ -6371,6 +6504,7 @@ function fbMerge(fbData) {
         users:          toArr(fbData.users),
         deletedRoomIds:  toArr(fbData.deletedRoomIds),
         deletedGuestIds: toArr(fbData.deletedGuestIds),
+        correctionLog:   toArr(fbData.correctionLog),
         settings:   { ...hotelData.settings, ...(fbData.settings || {}),
             roomStatuses: ensureDefaultRoomStatuses(rawStatuses) }
     };
