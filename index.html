@@ -1584,13 +1584,25 @@
 
                 <div class="stat-card mb-6">
                     <h3 class="text-lg font-bold mb-2 text-gray-800" data-i18n="exchange_rate_title">Exchange Rate</h3>
-                    <p class="text-gray-400 text-xs mb-4" data-i18n="exchange_rate_hint">Used to convert between USD and IQD at checkout (room price, deposit, services, and payment all get compared using this rate).</p>
-                    <div class="input-group" style="margin-bottom:0;">
-                        <label data-i18n="label_exchange_rate">1 USD = ? IQD</label>
-                        <div style="position:relative;">
-                            <span style="position:absolute;left:14px;top:50%;transform:translateY(-50%);color:#6b7280;font-weight:600;font-size:0.85rem;">$1 =</span>
-                            <input type="text" inputmode="numeric" id="settingsExchangeRate" placeholder="1500" style="padding-left:48px;"
-                                oninput="this.value=this.value.replace(/[^0-9]/g,'').replace(/\B(?=(\d{3})+(?!\d))/g,',')">
+                    <p class="text-gray-400 text-xs mb-4" data-i18n="exchange_rate_hint">Used to convert between USD and IQD everywhere in the app (check-in, check-out, deposits, reports). Two separate rates, since converting $ into IQD and converting IQD back into $ don't have to use the same number.</p>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div class="input-group" style="margin-bottom:0;">
+                            <label data-i18n="label_rate_usd_to_iqd">$ → IQD (Dollar to Dinar)</label>
+                            <div style="position:relative;">
+                                <span style="position:absolute;left:14px;top:50%;transform:translateY(-50%);color:#6b7280;font-weight:600;font-size:0.85rem;">$1 =</span>
+                                <input type="text" inputmode="numeric" id="settingsRateUSDtoIQD" placeholder="1500" style="padding-left:48px;"
+                                    oninput="this.value=this.value.replace(/[^0-9]/g,'').replace(/\B(?=(\d{3})+(?!\d))/g,',')">
+                            </div>
+                            <p class="text-xs text-gray-400 mt-1">A dollar amount is multiplied by this to get IQD.</p>
+                        </div>
+                        <div class="input-group" style="margin-bottom:0;">
+                            <label data-i18n="label_rate_iqd_to_usd">IQD → $ (Dinar to Dollar)</label>
+                            <div style="position:relative;">
+                                <span style="position:absolute;left:14px;top:50%;transform:translateY(-50%);color:#6b7280;font-weight:600;font-size:0.85rem;">$1 =</span>
+                                <input type="text" inputmode="numeric" id="settingsRateIQDtoUSD" placeholder="1500" style="padding-left:48px;"
+                                    oninput="this.value=this.value.replace(/[^0-9]/g,'').replace(/\B(?=(\d{3})+(?!\d))/g,',')">
+                            </div>
+                            <p class="text-xs text-gray-400 mt-1">An IQD amount is divided by this to get dollars.</p>
                         </div>
                     </div>
                 </div>
