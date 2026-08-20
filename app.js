@@ -72,7 +72,8 @@ const translations = {
         hotel_settings_title:'Hotel Settings', label_hotel_name:'Hotel Name',
         label_currency:'Currency', label_tax_rate:'Tax Rate (%)',
         exchange_rate_title:'Exchange Rate', label_exchange_rate:'1 USD = ? IQD',
-        exchange_rate_hint:'Used to convert between USD and IQD at checkout (room price, deposit, services, and payment all get compared using this rate).',
+        label_rate_usd_to_iqd:'$ → IQD (Dollar to Dinar)', label_rate_iqd_to_usd:'IQD → $ (Dinar to Dollar)',
+        exchange_rate_hint:'Used to convert between USD and IQD everywhere in the app (check-in, check-out, deposits, reports). Two separate rates, since converting $ into IQD and converting IQD back into $ don\'t have to use the same number.',
         checkout_cutoff_title:'Late Checkout Rule', label_checkout_cutoff:'Checkout Time',
         checkout_cutoff_hint:'If a guest is still in the room past this time on their checkout date, another night is automatically added to the bill.',
         lbl_late_checkout:'Late Checkout — Extra Night Added',
@@ -258,7 +259,8 @@ const translations = {
         hotel_settings_title:'إعدادات الفندق', label_hotel_name:'اسم الفندق',
         label_currency:'العملة', label_tax_rate:'نسبة الضريبة (%)',
         exchange_rate_title:'سعر الصرف', label_exchange_rate:'1 دولار = ؟ دينار عراقي',
-        exchange_rate_hint:'يُستخدم لتحويل العملة بين الدولار والدينار العراقي عند تسجيل الخروج (سعر الغرفة، العربون، الخدمات، والدفع تتم مقارنتها جميعها بهذا السعر).',
+        label_rate_usd_to_iqd:'$ ← IQD (دولار إلى دينار)', label_rate_iqd_to_usd:'IQD ← $ (دينار إلى دولار)',
+        exchange_rate_hint:'يُستخدم لتحويل العملة بين الدولار والدينار العراقي في كل مكان بالتطبيق (تسجيل الدخول، تسجيل الخروج، العربون، التقارير). سعران منفصلان، لأن تحويل الدولار إلى دينار وتحويل الدينار إلى دولار لا يجب أن يستخدما نفس الرقم.',
         checkout_cutoff_title:'قاعدة التأخير عن وقت الخروج', label_checkout_cutoff:'وقت تسجيل الخروج',
         checkout_cutoff_hint:'إذا بقي النزيل في الغرفة بعد هذا الوقت في يوم تسجيل الخروج، تُضاف ليلة أخرى تلقائياً إلى الفاتورة.',
         lbl_late_checkout:'تأخير عن الخروج — تمت إضافة ليلة',
@@ -410,6 +412,23 @@ function fmtUSD(n) {
     return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+// Two separate exchange rates, not one — converting a $ amount into IQD uses a different number
+// than converting an IQD amount back into $ (the buy/sell spread a real exchange counter runs on).
+// Both fall back to the old single `exchangeRate` setting (then 1500) for hotels that haven't set
+// the split rates yet, so existing data keeps behaving exactly as before until they do.
+function getRateUSDtoIQD() {
+    return hotelData.settings.rateUSDtoIQD || hotelData.settings.exchangeRate || 1500;
+}
+function getRateIQDtoUSD() {
+    return hotelData.settings.rateIQDtoUSD || hotelData.settings.exchangeRate || 1500;
+}
+function usdToIQD(usd) {
+    return (usd || 0) * getRateUSDtoIQD();
+}
+function iqdToUSD(iqd) {
+    return (iqd || 0) / getRateIQDtoUSD();
+}
+
 // Room + services combined, in the room's own currency — for a checked-out guest this is the real
 // final bill (isEstimate: false); for a guest still staying, it's what they'd owe if they checked
 // out right now (room rate × nights so far, plus any services already ordered), so History/Reports
@@ -417,12 +436,11 @@ function fmtUSD(n) {
 // checked out yet.
 function computeGuestTotal(guest) {
     const svcTotal = (guest.orders || []).reduce((s, o) => s + (o.price || 0) * (o.quantity || 1), 0);
-    const rate = hotelData.settings.exchangeRate || 1500;
 
     if (guest.roomAmountPaid != null) {
         const symbol = guest.roomCurrency || 'IQD';
         const svc = guest.serviceAmountIQD || 0;
-        const amount = (guest.roomAmountPaid || 0) + (symbol === 'IQD' ? svc : svc / rate);
+        const amount = (guest.roomAmountPaid || 0) + (symbol === 'IQD' ? svc : iqdToUSD(svc));
         return { amount, symbol, isEstimate: false };
     }
 
@@ -433,7 +451,7 @@ function computeGuestTotal(guest) {
     const isUSD      = guest.basePriceUSD > 0;
     const nightlyRate = isUSD ? (guest.basePriceUSD || 0) : (guest.basePriceIQD || guest.basePrice || 0);
     const roomTotal  = nightlyRate * nights;
-    const amount = roomTotal + (isUSD ? svcTotal / rate : svcTotal);
+    const amount = roomTotal + (isUSD ? iqdToUSD(svcTotal) : svcTotal);
     return { amount, symbol: isUSD ? '$' : 'IQD', isEstimate: true };
 }
 
@@ -559,7 +577,9 @@ let hotelData = {
         currency: 'USD',
         currencySymbol: '$',
         taxRate: 0,
-        exchangeRate: 1500,
+        exchangeRate: 1500, // legacy single rate — kept as a fallback for rateUSDtoIQD/rateIQDtoUSD below
+        rateUSDtoIQD: 1500, // $ → IQD: dollar amount × this = IQD
+        rateIQDtoUSD: 1500, // IQD → $: IQD amount ÷ this = dollar
         checkoutCutoffHour: 13, // 1:00 PM — staying past this on the checkout date auto-adds another night
         groupColor: '#8b5cf6', // room-card color for Group check-ins, kept distinct from the normal Occupied color
         paymentMethods: ['Cash', 'Card', 'Bank Transfer'],
@@ -1169,7 +1189,6 @@ function displayCheckInRooms(rooms) {
 
 let _lastCheckedInRoomId = null;
 let _checkoutBalanceIQD = 0;
-let _checkoutRate = 1500;
 // Tracks the currently-open Shift Report modal's parameters, if any, so it can be silently
 // re-rendered in place whenever hotelData changes (e.g. an admin correction elsewhere) — otherwise
 // the itemized rows inside an already-open report stay frozen at whatever they were when it was
@@ -1187,15 +1206,15 @@ function updateCheckoutRemaining() {
     const cashIQD = parseFloat((document.getElementById('checkoutCashIQD')?.value || '0').replace(/,/g, '')) || 0;
     const cashUSD = parseFloat(document.getElementById('checkoutCashUSD')?.value || '0') || 0;
     const cardIQD = parseFloat((document.getElementById('checkoutCardIQD')?.value || '0').replace(/,/g, '')) || 0;
-    const paidIQDEquivalent = cashIQD + cardIQD + (cashUSD * _checkoutRate);
+    const paidIQDEquivalent = cashIQD + cardIQD + usdToIQD(cashUSD);
     const remaining = _checkoutBalanceIQD - paidIQDEquivalent;
 
     if (remaining > 0.5) {
         el.style.background = '#fef2f2'; el.style.color = '#b91c1c';
-        el.innerHTML = `<i class="fas fa-exclamation-circle mr-1"></i>${t('lbl_remaining') || 'Remaining'}: IQD ${fmtIQD(remaining)} <span style="opacity:0.75;">(&asymp; $${fmtUSD(remaining / _checkoutRate)})</span>`;
+        el.innerHTML = `<i class="fas fa-exclamation-circle mr-1"></i>${t('lbl_remaining') || 'Remaining'}: IQD ${fmtIQD(remaining)} <span style="opacity:0.75;">(&asymp; $${fmtUSD(iqdToUSD(remaining))})</span>`;
     } else if (remaining < -0.5) {
         el.style.background = '#f0fdf4'; el.style.color = '#15803d';
-        el.innerHTML = `<i class="fas fa-coins mr-1"></i>${t('lbl_change_due') || 'Change due'}: IQD ${fmtIQD(-remaining)} <span style="opacity:0.75;">(&asymp; $${fmtUSD(-remaining / _checkoutRate)})</span>`;
+        el.innerHTML = `<i class="fas fa-coins mr-1"></i>${t('lbl_change_due') || 'Change due'}: IQD ${fmtIQD(-remaining)} <span style="opacity:0.75;">(&asymp; $${fmtUSD(iqdToUSD(-remaining))})</span>`;
     } else {
         el.style.background = '#f0fdf4'; el.style.color = '#15803d';
         el.innerHTML = `<i class="fas fa-check-circle mr-1"></i>${t('lbl_fully_paid_now') || 'Fully paid — no balance remaining'}`;
@@ -1584,12 +1603,14 @@ function loadCheckOutPage() {
 function filterCheckOutRooms() {
     const floor = document.getElementById('coFilterFloor')?.value || 'all';
     const type  = document.getElementById('coFilterType')?.value  || 'all';
-    const occupied = hotelData.rooms.filter(r => r.status === 'occupied' && r.currentGuest);
+    // A room being cleaned mid-stay still has a guest in it — currentGuest is what actually
+    // means "someone can be checked out of this room", not the occupied/cleaning status label.
+    const occupied = hotelData.rooms.filter(r => r.currentGuest);
     populateOccupiedRooms(applyRoomFilters(occupied, { floor, type }));
 }
 
 function populateOccupiedRooms(rooms = null) {
-    const occupiedRooms = rooms !== null ? rooms : hotelData.rooms.filter(r => r.status === 'occupied' && r.currentGuest);
+    const occupiedRooms = rooms !== null ? rooms : hotelData.rooms.filter(r => r.currentGuest);
     const list = document.getElementById('occupiedRoomsList');
     list.innerHTML = '';
 
@@ -1658,31 +1679,32 @@ function loadCheckOutForm(roomId) {
     const finalPrice = roomIsUSD ? (guest.basePriceUSD || 0) : (guest.basePriceIQD || guest.basePrice || 0);
 
     // Balance due after deposit (room charges + services - deposit already paid)
-    // Everything is converted to a single IQD figure using the exchange rate, so USD and IQD
-    // amounts (room price, deposit, services, payment) can be compared/combined directly.
-    const rate = hotelData.settings.exchangeRate || 1500;
+    // Everything is converted to a single IQD figure via usdToIQD/iqdToUSD, so USD and IQD amounts
+    // (room price, deposit, services, payment) can be compared/combined directly.
 
     // Discount is always entered in IQD, as a flat amount off the whole stay's room total (not
     // per night, not a percentage) — deducted in IQD terms regardless of whether the room itself is
     // priced in USD or IQD, then converted back so roomCharges stays in the room's own currency for
-    // everything downstream (balance math, the invoice line, confirmCheckOut's arguments, printing).
+    // everything downstream (the invoice line, confirmCheckOut's arguments, printing).
     const discountIQD = guest.discountIQD || 0;
     const roomChargesBeforeDiscount = finalPrice * nights;
-    const roomChargesBeforeDiscountIQD = roomIsUSD ? roomChargesBeforeDiscount * rate : roomChargesBeforeDiscount;
+    const roomChargesBeforeDiscountIQD = roomIsUSD ? usdToIQD(roomChargesBeforeDiscount) : roomChargesBeforeDiscount;
     const roomChargesIQDAfterDiscount = Math.max(0, roomChargesBeforeDiscountIQD - discountIQD);
-    const roomCharges = roomIsUSD ? roomChargesIQDAfterDiscount / rate : roomChargesIQDAfterDiscount;
+    const roomCharges = roomIsUSD ? iqdToUSD(roomChargesIQDAfterDiscount) : roomChargesIQDAfterDiscount;
 
     // Services always in IQD
     const serviceTotal = guest.orders.reduce((sum, order) => sum + (order.price * order.quantity), 0);
 
     const depositIQD = guest.depositIQD || 0;
     const depositUSD = guest.depositUSD || 0;
-    const roomChargeIQD = roomIsUSD ? roomCharges * rate : roomCharges;
-    const depositIQDEquivalent = depositIQD + (depositUSD * rate);
+    // Balance math uses the after-discount IQD figure directly rather than converting roomCharges
+    // back to IQD — round-tripping IQD → $ → IQD would silently gain or lose money as soon as the
+    // two exchange rates differ from each other.
+    const roomChargeIQD = roomChargesIQDAfterDiscount;
+    const depositIQDEquivalent = depositIQD + usdToIQD(depositUSD);
     const balanceIQD = Math.max(0, roomChargeIQD + serviceTotal - depositIQDEquivalent);
-    const balanceUSD = balanceIQD / rate;
+    const balanceUSD = iqdToUSD(balanceIQD);
     _checkoutBalanceIQD = balanceIQD;
-    _checkoutRate = rate;
     // If the deposit alone covers more than the full bill (room + services), the guest is owed
     // change back — track it explicitly so it can be recorded and deducted from the vault/shift
     // report, instead of just silently absorbing the overpaid deposit as if it were kept income.
@@ -1749,9 +1771,9 @@ function loadCheckOutForm(roomId) {
                     </div>
                     ${overpaidIQD > 0 ? `
                     <div class="text-sm mt-1" style="color:#b45309;font-weight:700;">
-                        <i class="fas fa-hand-holding-usd mr-1"></i>Change owed to guest: IQD ${fmtIQD(overpaidIQD)} <span style="color:#9ca3af;font-weight:500;">(&asymp; $${fmtUSD(overpaidIQD/rate)})</span>
+                        <i class="fas fa-hand-holding-usd mr-1"></i>Change owed to guest: IQD ${fmtIQD(overpaidIQD)} <span style="color:#9ca3af;font-weight:500;">(&asymp; $${fmtUSD(iqdToUSD(overpaidIQD))})</span>
                     </div>` : ''}
-                    <div class="text-xs text-gray-400 mt-1">${t('exchange_rate_note')||'Rate used'}: $1 = IQD ${fmtIQD(rate)}</div>
+                    <div class="text-xs text-gray-400 mt-1">${t('exchange_rate_note')||'Rate used'}: $1 → IQD ${fmtIQD(getRateUSDtoIQD())} &nbsp;|&nbsp; IQD ${fmtIQD(getRateIQDtoUSD())} → $1</div>
                 </div>
             </div>
         </div>
@@ -1906,21 +1928,20 @@ function confirmCheckOut(roomId, roomAmount, roomSymbol, serviceAmountIQD) {
     const guest = hotelData.guests.find(g => g.id === room.currentGuest.id);
     if (!guest) return;
 
-    // Calculate balance after deposit — everything converted to one IQD figure via the
-    // exchange rate, so USD/IQD room price, deposit, services, and payment all compare directly.
-    const rate = hotelData.settings.exchangeRate || 1500;
+    // Calculate balance after deposit — everything converted to one IQD figure via usdToIQD, so
+    // USD/IQD room price, deposit, services, and payment all compare directly.
     const depositIQD = guest.depositIQD || 0;
     const depositUSD = guest.depositUSD || 0;
-    const roomChargeIQD = roomSymbol === 'IQD' ? roomAmount : roomAmount * rate;
-    const depositIQDEquivalent = depositIQD + (depositUSD * rate);
+    const roomChargeIQD = roomSymbol === 'IQD' ? roomAmount : usdToIQD(roomAmount);
+    const depositIQDEquivalent = depositIQD + usdToIQD(depositUSD);
     const balanceIQD = Math.max(0, roomChargeIQD + serviceAmountIQD - depositIQDEquivalent);
-    const balanceUSD = balanceIQD / rate;
+    const balanceUSD = iqdToUSD(balanceIQD);
 
     // Read checkout payment amounts collected now
     const checkoutCashIQD = parseFloat((document.getElementById('checkoutCashIQD')?.value || '0').replace(/,/g, '')) || 0;
     const checkoutCashUSD = parseFloat(document.getElementById('checkoutCashUSD')?.value || '0') || 0;
     const checkoutCardIQD = parseFloat((document.getElementById('checkoutCardIQD')?.value || '0').replace(/,/g, '')) || 0;
-    const paidIQDEquivalent = checkoutCashIQD + checkoutCardIQD + (checkoutCashUSD * rate);
+    const paidIQDEquivalent = checkoutCashIQD + checkoutCardIQD + usdToIQD(checkoutCashUSD);
 
     // Change handed back when the deposit alone covers more than the full bill — only present when
     // that "Refund to Guest" section was actually rendered (loadCheckOutForm only shows it then).
@@ -1946,7 +1967,7 @@ function confirmCheckOut(roomId, roomAmount, roomSymbol, serviceAmountIQD) {
     // The stay's real total is room + services, not just the room — services are always tracked in
     // IQD, so convert them into the room's own currency before adding, keeping totalSpent in the
     // same currency as roomAmountPaid/roomCurrency (what every other place that reads it assumes).
-    guest.totalSpent      = roomAmount + (roomSymbol === 'IQD' ? serviceAmountIQD : serviceAmountIQD / rate);
+    guest.totalSpent      = roomAmount + (roomSymbol === 'IQD' ? serviceAmountIQD : iqdToUSD(serviceAmountIQD));
     guest.checkedOutAt    = new Date().toISOString();
     guest.checkedOutBy    = loggedInUser?.name || '—';
     guest.checkoutNote    = (document.getElementById('checkoutNote')?.value || '').trim();
@@ -2283,22 +2304,21 @@ function viewGuestDetails(guestId) {
         const amt = guest.roomAmountPaid || 0;
         const svc = guest.serviceAmountIQD || 0;
         const fmtAmt = v => sym === 'IQD' ? `IQD ${fmtIQD(v)}` : `$ ${v.toLocaleString()}`;
-        const rate = hotelData.settings.exchangeRate || 1500;
-        const total = amt + (sym === 'IQD' ? svc : svc / rate);
+        const total = amt + (sym === 'IQD' ? svc : iqdToUSD(svc));
         // Total actually collected across the whole stay: deposit paid at check-in + payment taken
         // at checkout, both converted to the room's currency so they compare directly against the
         // bill total above. This is the number that should reconcile with (be >=) the total bill —
         // shown here explicitly so "collected" and "total" are never mysteriously out of sync.
-        const depositIQDEq = (guest.depositCashIQD||0) + (guest.depositCardIQD||0) + (guest.depositCashUSD||0) * rate;
-        const checkoutIQDEq = (guest.checkoutCashIQD||0) + (guest.checkoutCardIQD||0) + (guest.checkoutCashUSD||0) * rate;
-        const refundIQDEq = (guest.refundCashIQD||0) + (guest.refundCardIQD||0) + (guest.refundCashUSD||0) * rate;
+        const depositIQDEq = (guest.depositCashIQD||0) + (guest.depositCardIQD||0) + usdToIQD(guest.depositCashUSD||0);
+        const checkoutIQDEq = (guest.checkoutCashIQD||0) + (guest.checkoutCardIQD||0) + usdToIQD(guest.checkoutCashUSD||0);
+        const refundIQDEq = (guest.refundCashIQD||0) + (guest.refundCardIQD||0) + usdToIQD(guest.refundCashUSD||0);
         const collectedIQDEq = depositIQDEq + checkoutIQDEq - refundIQDEq;
-        const collected = sym === 'IQD' ? collectedIQDEq : collectedIQDEq / rate;
+        const collected = sym === 'IQD' ? collectedIQDEq : iqdToUSD(collectedIQDEq);
         roomExpenseHtml = `
             ${(guest.discountIQD||0) > 0 ? `
             <div class="flex justify-between py-2 text-sm">
                 <span class="text-gray-700">${t('room_charges')} <span style="color:#9ca3af;">(before discount)</span></span>
-                <span class="font-semibold text-gray-800">${sym === 'IQD' ? `IQD ${fmtIQD(guest.roomChargesBeforeDiscountIQD||0)}` : `$ ${((guest.roomChargesBeforeDiscountIQD||0)/rate).toFixed(2)} <span style="color:#9ca3af;">(IQD ${fmtIQD(guest.roomChargesBeforeDiscountIQD||0)})</span>`}</span>
+                <span class="font-semibold text-gray-800">${sym === 'IQD' ? `IQD ${fmtIQD(guest.roomChargesBeforeDiscountIQD||0)}` : `$ ${iqdToUSD(guest.roomChargesBeforeDiscountIQD||0).toFixed(2)} <span style="color:#9ca3af;">(IQD ${fmtIQD(guest.roomChargesBeforeDiscountIQD||0)})</span>`}</span>
             </div>
             <div class="flex justify-between py-2 text-sm">
                 <span class="text-amber-700"><i class="fas fa-percent mr-1"></i>Discount</span>
@@ -2311,7 +2331,7 @@ function viewGuestDetails(guestId) {
             ${svc > 0 ? `
             <div class="flex justify-between py-2 text-sm">
                 <span class="text-gray-700">${t('services_label')}</span>
-                <span class="font-semibold text-gray-800">${sym === 'IQD' ? `IQD ${fmtIQD(svc)}` : `$ ${(svc/rate).toFixed(2)} <span style="color:#9ca3af;">(IQD ${fmtIQD(svc)})</span>`}</span>
+                <span class="font-semibold text-gray-800">${sym === 'IQD' ? `IQD ${fmtIQD(svc)}` : `$ ${iqdToUSD(svc).toFixed(2)} <span style="color:#9ca3af;">(IQD ${fmtIQD(svc)})</span>`}</span>
             </div>` : ''}
             <div class="flex justify-between py-2 border-t border-gray-200 mt-1">
                 <span class="font-bold text-blue-700">${t('grand_total_label')} (${t('room_charges')} + ${t('services_label')})</span>
@@ -2320,7 +2340,7 @@ function viewGuestDetails(guestId) {
             ${refundIQDEq > 0 ? `
             <div class="flex justify-between py-2 text-sm">
                 <span class="text-gray-700">Refunded to Guest</span>
-                <span class="font-semibold" style="color:#b45309;">- ${fmtAmt(refundIQDEq / (sym==='IQD'?1:rate))}</span>
+                <span class="font-semibold" style="color:#b45309;">- ${fmtAmt(sym==='IQD' ? refundIQDEq : iqdToUSD(refundIQDEq))}</span>
             </div>` : ''}
             <div class="flex justify-between py-2 mt-1" style="background:#f0fdf4;border-radius:6px;padding-left:8px;padding-right:8px;">
                 <span class="font-bold text-green-700">Total Collected (Deposit + Checkout Payment${refundIQDEq > 0 ? ' − Refund' : ''})</span>
@@ -2334,8 +2354,7 @@ function viewGuestDetails(guestId) {
         const isUSD     = guest.basePriceUSD > 0;
         const rate      = isUSD ? (guest.basePriceUSD || 0) : (guest.basePriceIQD || guest.basePrice || 0);
         const roomTotal = rate * nights;
-        const exRate    = hotelData.settings.exchangeRate || 1500;
-        const total     = roomTotal + (isUSD ? svcTotal / exRate : svcTotal);
+        const total     = roomTotal + (isUSD ? iqdToUSD(svcTotal) : svcTotal);
         const fmtRate   = isUSD ? `$ ${rate.toLocaleString()}` : `IQD ${fmtIQD(rate)}`;
         const fmtRoomTotal = isUSD ? `$ ${roomTotal.toLocaleString()}` : `IQD ${fmtIQD(roomTotal)}`;
         const fmtTotal  = isUSD ? `$ ${total.toLocaleString()}` : `IQD ${fmtIQD(total)}`;
@@ -2632,10 +2651,9 @@ function openAdminEditModal(kind, refId, orderId = null) {
             guest.refundCardIQD    = parseFloat((document.getElementById('aeRefCardIQD').value || '').replace(/,/g, '')) || 0;
             // Same as confirmCheckOut: total is room + services, converted into the room's own
             // currency so totalSpent stays consistent with roomAmountPaid/roomCurrency.
-            const rate = hotelData.settings.exchangeRate || 1500;
-            guest.totalSpent = guest.roomAmountPaid + (guest.roomCurrency === 'IQD' ? guest.serviceAmountIQD : guest.serviceAmountIQD / rate);
+            guest.totalSpent = guest.roomAmountPaid + (guest.roomCurrency === 'IQD' ? guest.serviceAmountIQD : iqdToUSD(guest.serviceAmountIQD));
             // Keep the "before discount" snapshot consistent with the corrected amount+discount.
-            const roomAmtIQD = guest.roomCurrency === 'IQD' ? guest.roomAmountPaid : guest.roomAmountPaid * rate;
+            const roomAmtIQD = guest.roomCurrency === 'IQD' ? guest.roomAmountPaid : usdToIQD(guest.roomAmountPaid);
             guest.roomChargesBeforeDiscountIQD = roomAmtIQD + guest.discountIQD;
             return true;
         };
@@ -3514,8 +3532,10 @@ function loadSettingsPage() {
             .map(tp => `<option value="${tp}">${tp}</option>`).join('');
     }
 
-    const rateEl = document.getElementById('settingsExchangeRate');
-    if (rateEl) rateEl.value = Math.round(hotelData.settings.exchangeRate || 1500).toLocaleString('en-US');
+    const rateBuyEl = document.getElementById('settingsRateUSDtoIQD');
+    if (rateBuyEl) rateBuyEl.value = Math.round(getRateUSDtoIQD()).toLocaleString('en-US');
+    const rateSellEl = document.getElementById('settingsRateIQDtoUSD');
+    if (rateSellEl) rateSellEl.value = Math.round(getRateIQDtoUSD()).toLocaleString('en-US');
 
     const groupColorEl = document.getElementById('settingsGroupColor');
     if (groupColorEl) groupColorEl.value = hotelData.settings.groupColor || '#8b5cf6';
@@ -3593,10 +3613,15 @@ function removeServiceCategory(index) {
 
 function saveSettings() {
     if (!requireOnline()) return;
-    const rateEl = document.getElementById('settingsExchangeRate');
-    if (rateEl) {
-        const rate = parseFloat((rateEl.value || '').replace(/,/g, '')) || 0;
-        if (rate > 0) hotelData.settings.exchangeRate = rate;
+    const rateBuyEl = document.getElementById('settingsRateUSDtoIQD');
+    if (rateBuyEl) {
+        const rate = parseFloat((rateBuyEl.value || '').replace(/,/g, '')) || 0;
+        if (rate > 0) hotelData.settings.rateUSDtoIQD = rate;
+    }
+    const rateSellEl = document.getElementById('settingsRateIQDtoUSD');
+    if (rateSellEl) {
+        const rate = parseFloat((rateSellEl.value || '').replace(/,/g, '')) || 0;
+        if (rate > 0) hotelData.settings.rateIQDtoUSD = rate;
     }
 
     const cutoffEl = document.getElementById('settingsCheckoutCutoffHour');
